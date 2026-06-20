@@ -1,0 +1,281 @@
+#!/bin/sh
+
+
+compareLines(){
+    #comparing values from both files
+    if [ "$F1" = "$F2" ] 
+    then
+        MATCH='YES'
+    fi
+}
+
+
+findChunks(){
+    # selecting set (chunk) with mac addresses from the second file
+    # grep -n = line num
+    # sed -n(=suppress) p(=write to stdout or in this case, variable)
+    START_MAC_2=$(grep 'MAC' -n "$FILE2" | cut -d ":" -f 1)
+    END_MAC_2=$(grep '],' -n "$FILE2" | cut -d ":" -f 1)
+   MAC_CHUNK_2=$(sed -n $((START_MAC_+1)),$((END_MAC_2-1))p "$FILE2")
+    
+    # selecting set (chunk) with packages from second file
+    START_PACKAGES_2=$(grep 'PACKAGES' -n "$FILE2" | cut -d ":" -f 1)
+    END_PACKAGES_2=$(grep ']' -n "$FILE2" | tail -n 1 |cut -d ":" -f 1)
+    PACKAGES_CHUNK_2=$(sed -n $((START_PACKAGES_2+1)),$((END_PACKAGES_2-1))p "$FILE2")
+
+    # where are start and end indexes of chunks in first file (when do we need to compare with chunks from second file)?
+    END_MAC_1=$(grep '],' -n "$FILE1" | cut -d ":" -f 1)
+    START_PACKAGES_1=$(grep 'PACKAGES' -n "$FILE1" | cut -d ":" -f 1)
+    END_PACKAGES_1=$(grep ']' -n "$FILE1" | tail -n 1 |cut -d ":" -f 1)
+
+}
+
+compareFiles(){
+    echo "comparing $FILE1 and $FILE2"
+    echo "---------------------------------"
+
+    printf "%s | %s | MATCH \n" "$FILE1" "$FILE2"
+    echo "---------------------------------"
+
+    # counter
+    C=1
+    
+    # finding indexes and preparing sets/chunks of mac addresses and packages from second file
+    findChunks
+
+    # reading from one file and indexing lines/searching for match in the second
+    while read -r LINE 
+    do
+	if [ "$C" -le "$START_MAC_2" ] || ( [ "$C" -ge "$END_MAC_1" ] && [ "$C" -le "$START_PACKAGES_1" ]) || [ "$C" -ge "$END_PACKAGES_1" ]
+	then
+    # comparing normal lines, not chunks
+    # F1 is value from the first file, F2 from the second
+	    KEY=$(echo "$LINE" | cut -d " " -f 1)
+	    F1=$(echo "$LINE" | cut -d " " -f 3)
+        F2=$(grep "$KEY" "$FILE2" -w | cut -d " " -f 3) 
+	
+	    MATCH='NO'
+	
+	    # skipping first and last line, because those are brackets
+	    if [ "$C" != 1 ] && [ "$KEY" != "[" ] && [ "$KEY" != '}' ] && [ "$KEY" != "]" ] && [ "$KEY" != "]," ] 
+        then
+        
+	    	if [ "$KEY" = "PACKAGES" ] || [ "$KEY" = "MAC" ]
+		    then 
+                # just printing headers
+		        printf "%s\n" "$KEY"
+		    
+		    else
+                # comparing values from files
+		        compareLines
+		        printf "%s || %s | %s || %s\n" "$KEY" "$F1" "$F2" "$MATCH"
+		    fi
+        else
+            # key equals to ending bracket -> end of chunk in file 1
+            # are there any mac addresses left in the 'set' after finishing first file?
+            if [ "$C" = "$END_MAC_1" ] && [ "$(echo "$MAC_CHUNK_2" | wc -l)" -gt 1 ]
+            then
+                # if yes, print them, they dont have a match
+                echo "$MAC_CHUNK_2" > /tmp/mac_chunk
+                while read -r MAC
+                do
+                    printf " - | %s || NOT FOUND\n" "$MAC"
+                done < /tmp/mac_chunk
+            fi
+            
+            if [ "$C" = "$END_PACKAGES_1" ] && [ "$(echo "$PACKAGES_CHUNK_2" | wc -l)" -gt 1 ]
+            then
+            # are there any packages left in the 'set'?
+                echo "$PACKAGES_CHUNK_2" > /tmp/package_chunk
+                while read -r PACKAGE
+                do
+                     # print them, without a match
+                    printf " - | %s || NOT FOUND\n" "$PACKAGE"
+                done < /tmp/package_chunk
+            fi
+        fi
+
+
+
+	# comparing packages and mac   
+    else
+        MATCH='NOT FOUND'
+        MATCHING='-'
+        # did we find strict(grep -w) match in chunk?
+         [ "$(echo "$MAC_CHUNK_2" | grep "$LINE" -w -c)" -eq 1 ] && { 
+            MATCH='FOUND'
+            MATCHING="$LINE"
+
+            # deleting found/matching from set
+            # grep -v = invert
+		    MAC_CHUNK_2=$(echo "$MAC_CHUNK_2" | grep -w -v "$LINE")
+            }
+            
+
+	   [ "$(echo "$PACKAGES_CHUNK_2" | grep "$LINE" -w -c)" -eq 1 ] && {
+            MATCH="FOUND"
+            MATCHING="$LINE"
+
+            # deleting found/matching from set
+		    PACKAGES_CHUNK_2=$(echo "$PACKAGES_CHUNK_2"  | grep  -w -v "$LINE")
+            }
+        printf "%s | %s || %s\n" "$LINE" "$MATCHING" "$MATCH"
+	fi
+
+	C=$((C+1))
+
+
+    done < "$FILE1"
+
+
+}
+
+printSummary(){
+    printf "{\n"
+    # date -Iminutes = iso format with min precision
+    printf "DATE : %s ,\n" "$(date -Iminutes | cut -d "+" -f 1)"
+    # name of the machine
+    printf "NAME : %s ,\n" "$(uname -n)" 
+    # searching in os-release file, alternative -f debian_version file + switch
+    printf "DISTRIBUTION : %s ,\n" "$(cat /etc/os-release | grep "NAME" -w | cut -d "=" -f 2)"
+    printf "VERSION : %s ,\n" "$(cat /etc/os-release | grep "VERSION_ID" | cut -d "=" -f 2)"
+
+    # getting mac addresses and saving them to temp file
+    (ip a | grep link/ | cut -d " " -f 6 | uniq -u ) > /tmp/mac_addr_list
+    printf "MAC : [\n"
+
+    # adding them line by line
+    while read -r MAC
+    do
+	printf "\t  %s,\n" "$MAC"
+    done < /tmp/mac_addr_list
+    printf "\t],\n"
+
+    # grep -A 2 finds match and returns 2 lines after, then inet, then 6th row (first 4
+    # are whitespaces)
+    printf "IP : %s,\n" "$(ip address | grep -A 2 "BROADCAST,MULTICAST,UP" | grep inet | cut -d " " -f 6)"
+
+    # saving apt output to temporary file
+    # tail -n +2 => skipping first line from apt (Listing ...)
+
+    #!!!!!!FINAL!!!!!!!!!!
+    (apt list --installed 2>/dev/null | cut -d "/" -f 1 | tail -n +2 | uniq -u ) > /tmp/apt_packages_list
+
+    #!!!!!test purposes only(shorter)!!!!!!!!!!!
+    #(apt list --installed 2>/dev/null | cut -d "/" -f 1 | tail -n +2 |head -5 | uniq -u ) > /tmp/apt_packages_list
+
+
+    printf "PACKAGES : [\n"
+    # adding packages from temp file
+    while read -r PACKAGE
+    do
+	printf "\t  %s,\n" "$PACKAGE"
+    done < /tmp/apt_packages_list
+    printf "\t]\n"
+    printf "}\n"
+}
+
+help() {
+    echo '-- USAGE -- '
+    echo 'techsummary -s <name.json> saves summary to file'
+    echo 'techsummary -s prints summary to stdout'
+    echo 'techsummary -c <file> <file> compares contents of both files'
+    echo 'techsummary -h prints help' 
+}
+
+
+#--- MAIN ---#
+# if no argument is given, print help and exit 
+if [ "$#" -eq 0 ]
+then
+    echo 'ERROR: No argument given!'
+    help
+    exit 0
+fi
+
+# max 3 arguments are allowed
+if [ "$#" -gt 3 ]
+then
+    echo 'ERROR: Incorrect argument count!'
+    help
+    exit 1
+fi
+
+# parse arguments
+ case "$1" in
+    -h)
+    help
+    exit 0
+    ;;
+
+    -s)
+    if [ "$#" -gt 2 ] 
+    then 
+        echo 'ERROR: Incorrect argument count!'
+        exit 1
+    fi
+
+    if [ "$#" -eq 1 ] 
+    # if no file was given, printing to stdout
+    then 
+        echo ' -- SUMMARY --'
+        printSummary
+    else
+    # else printing to given file
+        NEW="$2"
+        # file must end with .json, '.' matches any char
+        if [ "$(echo "$NEW" | grep -c ".\.json$")" -eq 1 ]
+            then 
+                printSummary > "$NEW"    
+            else
+                echo 'ERROR: File is not in .json format!'
+                exit 1
+            fi
+    fi
+    exit 0
+    ;;
+
+    -c)
+    if [ "$#" != 3 ]
+    # -c was called with invalid argument count
+    then 
+        echo 'ERROR: Incorrect argument count!'
+        echo 'usage: -c <file> <file>'
+        exit 1
+    fi
+
+    # do both files exist?
+    if [ -f "$2" ] && [ -f "$3" ] 
+    then
+        # are both files in correct format? , grep -c = count matching lines
+        if [ "$(echo "$2" | grep -c ".\.json$")" -eq 1 ] && [ "$(echo "$3" | grep -c ".\.json$")" -eq 1 ]
+        then
+            # longer file should be first
+            # cut because output of wc is [count] [name] (and we only need count)
+            if [ "$(wc -l "$2" | cut -d " " -f 1)" -gt "$(wc -l "$3" | cut -d " " -f 1)" ]
+            then
+            FILE1="$2"
+            FILE2="$3"
+            else
+            FILE1="$3"
+            FILE2="$2"
+            fi
+            compareFiles
+            exit 0
+        else
+            echo "ERROR: One of the files is not in .json format!"
+            exit 1
+        fi
+    else
+        echo 'ERROR: One of the files does not exist!'
+        exit 1
+    fi
+    
+    ;;
+
+    *)
+    echo 'ERROR: Incorrect argument used!'
+    help
+    exit 1
+    ;;
+    esac
